@@ -3,102 +3,100 @@
 // =============================
 const GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxTalJy8NES5PwLMqBgKtpAB9-QvqNIfIyWpm7oXzz0fcOETzrCUD28UgritPz5ZT7TDA/exec";
 
-// ถ้าคุณตั้ง API_KEY ใน Script Properties ให้ใส่ที่นี่ด้วย
-// const GAS_API_KEY = "xxxxx";
-const GAS_API_KEY = "";
-
 // ===== Scan / API behavior =====
 const SCAN_COOLDOWN_MS   = 800;
 const SAME_CODE_HOLD_MS  = 1800;
-const API_TIMEOUT_MS     = 15000;
+const API_LOCK_TIMEOUT   = 15000;
+const AUTO_RESTART_MS    = 1200;
 
 document.addEventListener('DOMContentLoaded', () => {
-  const searchInput  = document.getElementById('searchInput');
-  const btnSearch    = document.getElementById('btnSearch');
-  const btnStart     = document.getElementById('btnStart');
-  const btnStop      = document.getElementById('btnStop');
-  const qrVideo      = document.getElementById('qrVideo');
-  const cameraSelect = document.getElementById('cameraSelect');
+  const searchInput   = document.getElementById('searchInput');
+  const searchBtn     = document.getElementById('searchBtn');
+  const qrVideo       = document.getElementById('qrVideo');
+  const cameraSelect  = document.getElementById('cameraSelect');
+  const startButton   = document.getElementById('startCamera');
+  const stopButton    = document.getElementById('stopCamera');
 
   const codeReader = new ZXing.BrowserQRCodeReader();
 
-  // ===== State =====
-  let activeStream = null;
+  // ========= State =========
   let currentDeviceId = "";
-  let cameraRunning = false;
-
+  let cameraStarted = false;
   let apiBusy = false;
-  let pendingCode = ""; // ✅ คิวล่าสุด (กันสแกนหายตอนเน็ตช้า)
 
   let lastScanAt = 0;
   let lastText = "";
   let lastTextAt = 0;
 
-  let permissionState = "unknown"; // granted|denied|prompt|unknown
-  let starting = false;
+  let activeStream = null;          // stream ที่ใช้อยู่จริง
+  let permissionState = "unknown";  // "granted" | "denied" | "prompt" | "unknown"
+  let starting = false;             // กันกดเปิดกล้องซ้อน
 
-  // UX
-  searchInput.addEventListener('input', () => searchInput.value = searchInput.value.toUpperCase());
-  btnSearch.addEventListener('click', () => submitQuery(searchInput.value));
-  searchInput.addEventListener('keyup', (e) => { if (e.key === 'Enter') submitQuery(searchInput.value); });
+  // ========= UX =========
+  window.onclick = (e) => { if (e.target.id !== 'cameraSelect') searchInput.focus(); };
+  searchInput.addEventListener('input', () => { searchInput.value = searchInput.value.toUpperCase(); });
+  searchBtn.addEventListener('click', () => runSearch(searchInput.value));
+  searchInput.addEventListener('keyup', (e) => { if (e.key === 'Enter') runSearch(searchInput.value); });
 
-  btnStart.addEventListener('click', async () => {
+  // ✅ มาตรฐาน: ขอ permission เฉพาะจาก user gesture (กดปุ่ม)
+  startButton.addEventListener('click', async () => {
     if (starting) return;
     starting = true;
     try {
-      await startFlow();
+      await startFlow_();
     } finally {
       starting = false;
     }
   });
 
-  btnStop.addEventListener('click', async () => {
-    await stopCamera();
-  });
+  stopButton.addEventListener('click', () => stopCamera());
 
+  // สลับกล้อง: stop ก่อน แล้วค่อย start ใหม่ (ไม่ขอ permission ซ้ำถ้า granted แล้ว)
   cameraSelect.addEventListener('change', async () => {
-    if (!cameraRunning) return;
-    await restartWithDevice(cameraSelect.value);
+    if (!cameraStarted) return;
+    await restartWithDevice_(cameraSelect.value);
   });
 
-  // --------- helpers ----------
-  function isLineInAppBrowser() {
-    const ua = navigator.userAgent || "";
-    return /Line\/|LINE\//i.test(ua) || /LIFF/i.test(ua);
-  }
+  // ======== Permission / Device =========
 
-  async function queryPermission() {
+  async function queryCameraPermission_() {
+    // permissions API ไม่รองรับทุกเบราว์เซอร์ → fallback unknown
     try {
       if (!navigator.permissions?.query) return "unknown";
       const p = await navigator.permissions.query({ name: "camera" });
       permissionState = p.state || "unknown";
-      try { p.onchange = () => permissionState = p.state || "unknown"; } catch (_) {}
+      // ติดตามการเปลี่ยน state
+      try {
+        p.onchange = () => { permissionState = p.state || "unknown"; };
+      } catch (_) {}
       return permissionState;
     } catch (_) {
       return "unknown";
     }
   }
 
-  async function listCameras() {
+  async function listVideoDevices_() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     return devices.filter(d => d.kind === "videoinput");
   }
 
-  function isMobile() {
+  function isMobile_() {
     return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   }
 
-  function pickDefaultDevice(devices) {
+  function pickDefaultDevice_(devices) {
     if (!devices?.length) return "";
-    if (isMobile()) {
+    if (isMobile_()) {
+      // หลัง permission แล้ว label มักมี back/rear
       const back = devices.find(d => /back|rear|environment/i.test(d.label || ""));
       return (back?.deviceId) || devices[0].deviceId;
     }
     return devices[0].deviceId;
   }
 
-  async function refreshCameraSelect() {
-    const cams = await listCameras();
+  async function refreshCameraSelect_() {
+    const cams = await listVideoDevices_();
+
     cameraSelect.innerHTML = "";
     cams.forEach((d, idx) => {
       const opt = document.createElement("option");
@@ -107,63 +105,59 @@ document.addEventListener('DOMContentLoaded', () => {
       cameraSelect.appendChild(opt);
     });
 
-    if (!currentDeviceId) currentDeviceId = pickDefaultDevice(cams);
+    const def = pickDefaultDevice_(cams);
+    if (!currentDeviceId) currentDeviceId = def;
     if (currentDeviceId) cameraSelect.value = currentDeviceId;
   }
 
-  // --------- Camera flow (มาตรฐาน) ----------
-  async function startFlow() {
+  // ======== Camera start flow (Modern Standard) =========
+  async function startFlow_() {
     if (!navigator.mediaDevices?.getUserMedia) {
       return Swal.fire({ icon:'error', title:'ไม่รองรับกล้อง', text:'เบราว์เซอร์นี้ไม่รองรับ getUserMedia', confirmButtonText:'OK' });
     }
 
-    // เตือนกรณี LINE (เพราะบางเครื่องไม่ให้กล้อง)
-    if (isLineInAppBrowser()) {
-      await Swal.fire({
-        icon: 'info',
-        title: 'เปิดในเบราว์เซอร์เพื่อใช้กล้อง',
-        html: `<div style="text-align:left;font-size:14px;line-height:1.5">
-          LINE อาจจำกัดการใช้กล้องในบางรุ่น/บางเครื่อง<br>
-          แนะนำ: กด “…” → <b>เปิดในเบราว์เซอร์</b> (Chrome/Safari)
-        </div>`,
-        confirmButtonText: 'OK'
-      });
-    }
+    // 1) ตรวจ permission state (ถ้ารองรับ)
+    const p = await queryCameraPermission_();
 
-    const p = await queryPermission();
+    // 2) ถ้า denied → บอกวิธีเปิดสิทธิ์ (อย่าพยายามเรียก getUserMedia ซ้ำ จะเด้ง/ล้มเหลว)
     if (p === "denied") {
       return Swal.fire({
-        icon:'warning',
-        title:'ไม่ได้รับอนุญาตใช้กล้อง',
-        html:`<div style="text-align:left;font-size:14px">
-          กรุณาอนุญาตกล้อง แล้วกลับมากด “เปิดกล้อง” อีกครั้ง<br><br>
-          • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
-          • Android: Site settings → Camera → Allow
-        </div>`,
-        confirmButtonText:'OK',
-        allowOutsideClick:false
+        icon: 'warning',
+        title: 'ไม่ได้รับอนุญาตใช้กล้อง',
+        html: `
+          <div style="text-align:left;font-size:14px">
+            กรุณาอนุญาตกล้องในการตั้งค่าเบราว์เซอร์/โทรศัพท์ แล้วลองใหม่<br><br>
+            • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
+            • Android: Site settings → Camera → Allow<br><br>
+            จากนั้นกลับมากด “เปิดกล้อง” อีกครั้ง
+          </div>
+        `,
+        confirmButtonText: 'OK',
+        allowOutsideClick: false
       });
     }
 
-    // ถ้ามี stream live อยู่แล้ว ไม่ขอซ้ำ
+    // 3) ถ้าเคยมี stream แล้วและยังใช้งานได้ → ไม่ขอ permission ใหม่ (กันเด้งซ้ำ)
     if (activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
-      cameraRunning = true;
-      try { await refreshCameraSelect(); } catch (_) {}
-      startDecodeLoop(currentDeviceId || null);
+      cameraStarted = true;
+      try { await refreshCameraSelect_(); } catch (_) {}
+      decodeLoop_(currentDeviceId || null);
       return;
     }
 
-    // ขอเปิด stream ครั้งเดียว
-    await openCameraOnce();
+    // 4) ขอ stream “ครั้งเดียว” (permission prompt จะขึ้นเฉพาะครั้งนี้)
+    //    ใช้ fallback แบบมาตรฐาน: deviceId(ถ้ามี) → facingMode → video:true
+    await openCameraOnce_();
 
-    // หลัง permission แล้ว label/device list จะมาดีขึ้น
-    try { await refreshCameraSelect(); } catch (_) {}
+    // 5) หลังได้ permission แล้ว ค่อย refresh รายชื่อกล้อง (label/deviceId จะมาเต็ม)
+    try { await refreshCameraSelect_(); } catch (_) {}
 
-    cameraRunning = true;
-    startDecodeLoop(currentDeviceId || null);
+    cameraStarted = true;
+    decodeLoop_(currentDeviceId || null);
   }
 
-  async function openCameraOnce() {
+  async function openCameraOnce_() {
+    // ปิดก่อนเผื่อค้าง
     await stopCamera();
 
     const tryOpen = async (constraints) => {
@@ -176,16 +170,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const wantDeviceId = cameraSelect.value || currentDeviceId || "";
 
-    // Try 1 exact deviceId
+    // Try 1: exact deviceId (ถ้ามี)
     if (wantDeviceId) {
       try {
         await tryOpen({
-          audio:false,
-          video:{
-            deviceId:{ exact: wantDeviceId },
-            width:{ ideal:1280 },
-            height:{ ideal:720 },
-            frameRate:{ ideal:30, max:30 }
+          audio: false,
+          video: {
+            deviceId: { exact: wantDeviceId },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30, max: 30 }
           }
         });
         currentDeviceId = wantDeviceId;
@@ -193,39 +187,49 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (_) {}
     }
 
-    // Try 2 facingMode environment
+    // Try 2: facingMode environment (มือถือ)
     try {
       await tryOpen({
-        audio:false,
-        video:{
-          facingMode:{ ideal:"environment" },
-          width:{ ideal:1280 },
-          height:{ ideal:720 }
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
         }
       });
       return;
     } catch (_) {}
 
-    // Try 3 video:true
-    await tryOpen({ video:true, audio:false });
+    // Try 3: video:true (ให้ browser เลือกเอง)
+    try {
+      await tryOpen({ video: true, audio: false });
+      return;
+    } catch (err) {
+      console.error("openCameraOnce_ failed:", err);
+      throw err;
+    }
   }
 
-  async function restartWithDevice(deviceId) {
+  async function restartWithDevice_(deviceId) {
     currentDeviceId = deviceId || currentDeviceId || "";
     try {
-      await openCameraOnce();
-      cameraRunning = true;
-      startDecodeLoop(currentDeviceId || null);
+      await openCameraOnce_();          // เปิดใหม่ครั้งเดียว
+      cameraStarted = true;
+      decodeLoop_(currentDeviceId || null);
     } catch (err) {
-      cameraRunning = false;
-      Swal.fire({ icon:'error', title:'สลับกล้องไม่สำเร็จ', text:'ลองปิดกล้องแล้วเปิดใหม่', confirmButtonText:'OK' });
+      cameraStarted = false;
+      Swal.fire({
+        icon: 'error',
+        title: 'สลับกล้องไม่สำเร็จ',
+        text: 'ลองปิดกล้องแล้วเปิดใหม่ หรือเลือกกล้องอีกครั้ง',
+        confirmButtonText: 'OK'
+      });
     }
   }
 
   async function stopCamera() {
     apiBusy = false;
-    cameraRunning = false;
-    pendingCode = "";
+    cameraStarted = false;
 
     try { codeReader.reset(); } catch (_) {}
 
@@ -238,13 +242,14 @@ document.addEventListener('DOMContentLoaded', () => {
     qrVideo.srcObject = null;
   }
 
-  function startDecodeLoop(deviceIdOrNull) {
+  function decodeLoop_(deviceIdOrNull) {
     try { codeReader.reset(); } catch (_) {}
 
     codeReader.decodeFromVideoDevice(deviceIdOrNull, qrVideo, async (result, err) => {
       if (!result) return;
 
       const now = Date.now();
+      if (apiBusy) return;
       if (now - lastScanAt < SCAN_COOLDOWN_MS) return;
 
       const text = String(result.getText() || "").trim().toUpperCase();
@@ -257,47 +262,37 @@ document.addEventListener('DOMContentLoaded', () => {
       lastTextAt = now;
 
       playScanSound();
-      onScanned(text);
+
+      apiBusy = true;
+      try {
+        await runSearch(text);
+      } finally {
+        apiBusy = false;
+      }
     });
   }
 
-  function onScanned(code) {
-    if (apiBusy) { pendingCode = code; return; }
-    apiBusy = true;
-
-    runSearch(code)
-      .catch(()=>{})
-      .finally(() => {
-        apiBusy = false;
-        if (pendingCode) {
-          const next = pendingCode;
-          pendingCode = "";
-          onScanned(next);
-        }
-      });
-  }
-
-  // --------- Search / API ----------
-  async function submitQuery(q) {
-    q = String(q || "").trim().toUpperCase();
-    if (!q) return;
-    onScanned(q);
-    searchInput.value = "";
-  }
+  // ====== Search / GAS JSONP ======
 
   async function runSearch(query) {
     query = String(query || "").trim().toUpperCase();
     if (!query) return;
 
     try {
-      const res = await gasJsonp({ action:"search", query, key: GAS_API_KEY || undefined });
-
+      const res = await gasJsonp({ action: "search", query });
       if (!res || !res.ok) throw new Error(res?.error || "API Error");
 
       const htmlString = res.html || "";
       if (!htmlString) {
         playErrorSound();
-        await Swal.fire({ icon:'error', title:'ไม่พบข้อมูล', text:'กรุณาตรวจสอบข้อมูลการค้นหาอีกครั้ง', confirmButtonText:'OK', allowOutsideClick:false });
+        await Swal.fire({
+          icon:'error',
+          title:'ไม่พบข้อมูล',
+          text:'กรุณาตรวจสอบข้อมูลการค้นหาอีกครั้ง',
+          confirmButtonText:'OK',
+          allowOutsideClick:false
+        });
+        searchInput.value = '';
         return;
       }
 
@@ -321,22 +316,34 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       await Swal.fire({
-        title:'ข้อมูล',
+        title: 'ข้อมูล',
         html: doc.body.innerHTML,
-        confirmButtonText:'OK',
-        showCloseButton:true,
-        allowOutsideClick:false,
+        confirmButtonText: 'OK',
+        showCloseButton: true,
+        allowOutsideClick: false,
         timer: 5000
       });
+
+      searchInput.value = '';
 
     } catch (err) {
       console.error(err);
       playErrorSound();
-      await Swal.fire({ icon:'error', title:'Error', text:String(err?.message || err), confirmButtonText:'OK', allowOutsideClick:false });
+      await Swal.fire({
+        icon:'error',
+        title:'Error',
+        text: String(err?.message || err),
+        confirmButtonText:'OK',
+        allowOutsideClick:false
+      });
+
+      // auto restart only if camera is off (avoid repeated permission prompts)
+      setTimeout(() => {
+        if (!cameraStarted && permissionState !== "denied") startFlow_().catch(()=>{});
+      }, AUTO_RESTART_MS);
     }
   }
 
-  // JSONP (กัน CORS)
   function gasJsonp(params) {
     return new Promise((resolve, reject) => {
       if (!GAS_WEBAPP_URL) return reject(new Error("ยังไม่ได้ตั้งค่า GAS_WEBAPP_URL"));
@@ -351,7 +358,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const timer = setTimeout(() => {
         cleanup();
         reject(new Error("timeout เรียก Apps Script"));
-      }, API_TIMEOUT_MS);
+      }, API_LOCK_TIMEOUT);
 
       window[cbName] = (data) => {
         clearTimeout(timer);
@@ -378,7 +385,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const usp = new URLSearchParams();
     Object.keys(obj || {}).forEach(k => {
       const v = obj[k];
-      if (v === undefined || v === null || v === "") return;
+      if (v === undefined || v === null) return;
       usp.set(k, String(v));
     });
     return usp.toString();
@@ -388,6 +395,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const s = document.getElementById('scanSound');
     if (s) { s.volume = 1.0; s.play().catch(()=>{}); }
   }
+
   function playErrorSound() {
     const s = document.getElementById('errorSound');
     if (s) { s.volume = 1.0; s.play().catch(()=>{}); }
