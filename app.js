@@ -10,6 +10,11 @@ const API_LOCK_TIMEOUT   = 15000;
 const AUTO_RESTART_MS    = 1200;
 
 document.addEventListener('DOMContentLoaded', () => {
+  // ===== PWA: Service Worker =====
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js").catch(()=>{});
+  }
+
   const searchInput   = document.getElementById('searchInput');
   const searchBtn     = document.getElementById('searchBtn');
   const qrVideo       = document.getElementById('qrVideo');
@@ -28,9 +33,8 @@ document.addEventListener('DOMContentLoaded', () => {
   let lastText = "";
   let lastTextAt = 0;
 
-  let activeStream = null;          // stream ที่ใช้อยู่จริง
-  let permissionState = "unknown";  // "granted" | "denied" | "prompt" | "unknown"
-  let starting = false;             // กันกดเปิดกล้องซ้อน
+  let activeStream = null;
+  let starting = false;
 
   // ========= UX =========
   window.onclick = (e) => { if (e.target.id !== 'cameraSelect') searchInput.focus(); };
@@ -38,7 +42,7 @@ document.addEventListener('DOMContentLoaded', () => {
   searchBtn.addEventListener('click', () => runSearch(searchInput.value));
   searchInput.addEventListener('keyup', (e) => { if (e.key === 'Enter') runSearch(searchInput.value); });
 
-  // ✅ มาตรฐาน: ขอ permission เฉพาะจาก user gesture (กดปุ่ม)
+  // ✅ ขอ permission เฉพาะจาก user gesture
   startButton.addEventListener('click', async () => {
     if (starting) return;
     starting = true;
@@ -51,25 +55,28 @@ document.addEventListener('DOMContentLoaded', () => {
 
   stopButton.addEventListener('click', () => stopCamera());
 
-  // สลับกล้อง: stop ก่อน แล้วค่อย start ใหม่ (ไม่ขอ permission ซ้ำถ้า granted แล้ว)
   cameraSelect.addEventListener('change', async () => {
     if (!cameraStarted) return;
     await restartWithDevice_(cameraSelect.value);
   });
 
-  // ======== Permission / Device =========
+  // ======== helpers ========
+
+  function isMobile_() {
+    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  }
+
+  function isInAppBrowser_() {
+    // ช่วยเดาว่าเปิดจาก in-app browser (LINE/FB/IG) หรือไม่
+    const ua = navigator.userAgent || "";
+    return /Line|FBAN|FBAV|Instagram/i.test(ua);
+  }
 
   async function queryCameraPermission_() {
-    // permissions API ไม่รองรับทุกเบราว์เซอร์ → fallback unknown
     try {
       if (!navigator.permissions?.query) return "unknown";
       const p = await navigator.permissions.query({ name: "camera" });
-      permissionState = p.state || "unknown";
-      // ติดตามการเปลี่ยน state
-      try {
-        p.onchange = () => { permissionState = p.state || "unknown"; };
-      } catch (_) {}
-      return permissionState;
+      return p.state || "unknown";
     } catch (_) {
       return "unknown";
     }
@@ -80,14 +87,9 @@ document.addEventListener('DOMContentLoaded', () => {
     return devices.filter(d => d.kind === "videoinput");
   }
 
-  function isMobile_() {
-    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  }
-
   function pickDefaultDevice_(devices) {
     if (!devices?.length) return "";
     if (isMobile_()) {
-      // หลัง permission แล้ว label มักมี back/rear
       const back = devices.find(d => /back|rear|environment/i.test(d.label || ""));
       return (back?.deviceId) || devices[0].deviceId;
     }
@@ -108,48 +110,71 @@ document.addEventListener('DOMContentLoaded', () => {
     const def = pickDefaultDevice_(cams);
     if (!currentDeviceId) currentDeviceId = def;
     if (currentDeviceId) cameraSelect.value = currentDeviceId;
+
+    // UX: ถ้ามีกล้องเดียว ซ่อน dropdown
+    cameraSelect.style.display = (cams.length <= 1) ? "none" : "block";
   }
 
-  // ======== Camera start flow (Modern Standard) =========
+  // ======== Camera flow ========
+
   async function startFlow_() {
     if (!navigator.mediaDevices?.getUserMedia) {
-      return Swal.fire({ icon:'error', title:'ไม่รองรับกล้อง', text:'เบราว์เซอร์นี้ไม่รองรับ getUserMedia', confirmButtonText:'OK' });
+      return Swal.fire({ icon:'error', title:'ไม่รองรับกล้อง', text:'เบราว์เซอร์นี้ไม่รองรับการใช้งานกล้อง', confirmButtonText:'OK' });
     }
 
-    // 1) ตรวจ permission state (ถ้ารองรับ)
-    const p = await queryCameraPermission_();
+    // ถ้าเปิดใน in-app browser ให้เตือน (ช่วยลดปัญหา permission เด้ง/เลือกกล้องไม่ได้)
+    if (isInAppBrowser_()) {
+      await Swal.fire({
+        icon: 'info',
+        title: 'แนะนำให้เปิดด้วย Chrome/Safari',
+        html: `<div style="font-size:14px;text-align:left">
+          บางเครื่องเมื่อเปิดผ่าน LINE/FB/IG จะขออนุญาตซ้ำหรือเปิดกล้องไม่ได้<br>
+          แนะนำ: เปิดลิงก์นี้ด้วย Chrome/Safari โดยตรง หรือ “Add to Home Screen” (PWA)
+        </div>`,
+        confirmButtonText: 'เข้าใจแล้ว'
+      });
+    }
 
-    // 2) ถ้า denied → บอกวิธีเปิดสิทธิ์ (อย่าพยายามเรียก getUserMedia ซ้ำ จะเด้ง/ล้มเหลว)
+    // ถ้ากล้องยัง live อยู่ → ไม่ขอ permission ใหม่ (กันเด้ง)
+    if (activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
+      cameraStarted = true;
+      decodeLoop_(currentDeviceId || null);
+      return;
+    }
+
+    // ถ้า permission denied (ในเบราว์เซอร์ที่รองรับ permissions) → ไม่ต้องพยายามขอซ้ำ
+    const p = await queryCameraPermission_();
     if (p === "denied") {
       return Swal.fire({
         icon: 'warning',
         title: 'ไม่ได้รับอนุญาตใช้กล้อง',
-        html: `
-          <div style="text-align:left;font-size:14px">
-            กรุณาอนุญาตกล้องในการตั้งค่าเบราว์เซอร์/โทรศัพท์ แล้วลองใหม่<br><br>
-            • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
-            • Android: Site settings → Camera → Allow<br><br>
-            จากนั้นกลับมากด “เปิดกล้อง” อีกครั้ง
-          </div>
-        `,
+        html: `<div style="text-align:left;font-size:14px">
+          กรุณาอนุญาตกล้องในการตั้งค่า แล้วกลับมากด “เปิดกล้อง” อีกครั้ง<br><br>
+          • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
+          • Android: Site settings → Camera → Allow
+        </div>`,
         confirmButtonText: 'OK',
         allowOutsideClick: false
       });
     }
 
-    // 3) ถ้าเคยมี stream แล้วและยังใช้งานได้ → ไม่ขอ permission ใหม่ (กันเด้งซ้ำ)
-    if (activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
-      cameraStarted = true;
-      try { await refreshCameraSelect_(); } catch (_) {}
-      decodeLoop_(currentDeviceId || null);
-      return;
+    // เปิดกล้อง “ครั้งเดียว” (นี่คือจุดที่ prompt จะเกิดแค่ครั้งเดียว)
+    try {
+      await openCameraOnce_();
+    } catch (err) {
+      console.error(err);
+      const name = err?.name || "CameraError";
+      let msg = "ไม่สามารถเปิดกล้องได้";
+
+      if (name === "NotAllowedError") msg = "คุณกดไม่อนุญาตกล้อง หรือระบบบล็อกสิทธิ์กล้อง";
+      if (name === "NotFoundError")  msg = "ไม่พบกล้องในอุปกรณ์นี้";
+      if (name === "NotReadableError") msg = "กล้องถูกใช้งานโดยแอปอื่นอยู่ (ปิดแอป/แท็บอื่นก่อน)";
+      if (name === "OverconstrainedError") msg = "เลือกกล้อง/ความละเอียดที่อุปกรณ์ไม่รองรับ";
+
+      return Swal.fire({ icon:'error', title:'เปิดกล้องไม่สำเร็จ', text: msg, confirmButtonText:'OK' });
     }
 
-    // 4) ขอ stream “ครั้งเดียว” (permission prompt จะขึ้นเฉพาะครั้งนี้)
-    //    ใช้ fallback แบบมาตรฐาน: deviceId(ถ้ามี) → facingMode → video:true
-    await openCameraOnce_();
-
-    // 5) หลังได้ permission แล้ว ค่อย refresh รายชื่อกล้อง (label/deviceId จะมาเต็ม)
+    // หลังได้ permission แล้ว ค่อย refresh รายชื่อกล้องเพื่อให้ label มาเต็ม
     try { await refreshCameraSelect_(); } catch (_) {}
 
     cameraStarted = true;
@@ -157,8 +182,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function openCameraOnce_() {
-    // ปิดก่อนเผื่อค้าง
-    await stopCamera();
+    await stopCamera(); // กันค้าง
 
     const tryOpen = async (constraints) => {
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -170,7 +194,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const wantDeviceId = cameraSelect.value || currentDeviceId || "";
 
-    // Try 1: exact deviceId (ถ้ามี)
+    // Try 1: deviceId exact (ถ้ามี)
     if (wantDeviceId) {
       try {
         await tryOpen({
@@ -187,7 +211,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (_) {}
     }
 
-    // Try 2: facingMode environment (มือถือ)
+    // Try 2: environment (มือถือ)
     try {
       await tryOpen({
         audio: false,
@@ -200,20 +224,14 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     } catch (_) {}
 
-    // Try 3: video:true (ให้ browser เลือกเอง)
-    try {
-      await tryOpen({ video: true, audio: false });
-      return;
-    } catch (err) {
-      console.error("openCameraOnce_ failed:", err);
-      throw err;
-    }
+    // Try 3: browser choose
+    await tryOpen({ video: true, audio: false });
   }
 
   async function restartWithDevice_(deviceId) {
     currentDeviceId = deviceId || currentDeviceId || "";
     try {
-      await openCameraOnce_();          // เปิดใหม่ครั้งเดียว
+      await openCameraOnce_();
       cameraStarted = true;
       decodeLoop_(currentDeviceId || null);
     } catch (err) {
@@ -242,6 +260,8 @@ document.addEventListener('DOMContentLoaded', () => {
     qrVideo.srcObject = null;
   }
 
+  // ======== Decode ========
+
   function decodeLoop_(deviceIdOrNull) {
     try { codeReader.reset(); } catch (_) {}
 
@@ -263,11 +283,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
       playScanSound();
 
+      // วิธีที่นิ่งสุด: ระหว่างยิง API “พักสแกน” (reset) แล้วค่อยเริ่มใหม่หลัง popup ปิด
       apiBusy = true;
       try {
+        try { codeReader.reset(); } catch (_) {}
         await runSearch(text);
       } finally {
         apiBusy = false;
+        if (cameraStarted) decodeLoop_(currentDeviceId || null);
       }
     });
   }
@@ -296,7 +319,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // highlight
       const parser = new DOMParser();
       const doc = parser.parseFromString(htmlString, 'text/html');
       const rows = doc.getElementsByTagName('tr');
@@ -337,9 +359,8 @@ document.addEventListener('DOMContentLoaded', () => {
         allowOutsideClick:false
       });
 
-      // auto restart only if camera is off (avoid repeated permission prompts)
       setTimeout(() => {
-        if (!cameraStarted && permissionState !== "denied") startFlow_().catch(()=>{});
+        if (!cameraStarted) startFlow_().catch(()=>{});
       }, AUTO_RESTART_MS);
     }
   }
