@@ -4,10 +4,10 @@
 const GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxTalJy8NES5PwLMqBgKtpAB9-QvqNIfIyWpm7oXzz0fcOETzrCUD28UgritPz5ZT7TDA/exec";
 
 // ===== Scan / API behavior =====
-const SCAN_COOLDOWN_MS   = 800;    // กันสแกนรัว
-const SAME_CODE_HOLD_MS  = 1800;   // กัน QR เดิมซ้ำ
-const API_LOCK_TIMEOUT   = 15000;  // timeout เรียก GAS
-const AUTO_RESTART_MS    = 1200;   // ถ้ากล้องหลุด ให้เริ่มใหม่
+const SCAN_COOLDOWN_MS   = 800;
+const SAME_CODE_HOLD_MS  = 1800;
+const API_LOCK_TIMEOUT   = 15000;
+const AUTO_RESTART_MS    = 1200;
 
 document.addEventListener('DOMContentLoaded', () => {
   const searchInput   = document.getElementById('searchInput');
@@ -17,10 +17,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const startButton   = document.getElementById('startCamera');
   const stopButton    = document.getElementById('stopCamera');
 
-  // ZXing reader
   const codeReader = new ZXing.BrowserQRCodeReader();
 
-  // state
+  // ========= State =========
   let currentDeviceId = "";
   let cameraStarted = false;
   let apiBusy = false;
@@ -29,187 +28,203 @@ document.addEventListener('DOMContentLoaded', () => {
   let lastText = "";
   let lastTextAt = 0;
 
-  // stream handle
-  let activeStream = null;
+  let activeStream = null;          // stream ที่ใช้อยู่จริง
+  let permissionState = "unknown";  // "granted" | "denied" | "prompt" | "unknown"
+  let starting = false;             // กันกดเปิดกล้องซ้อน
 
-  // UX
+  // ========= UX =========
   window.onclick = (e) => { if (e.target.id !== 'cameraSelect') searchInput.focus(); };
   searchInput.addEventListener('input', () => { searchInput.value = searchInput.value.toUpperCase(); });
-
   searchBtn.addEventListener('click', () => runSearch(searchInput.value));
   searchInput.addEventListener('keyup', (e) => { if (e.key === 'Enter') runSearch(searchInput.value); });
 
-  // ให้ผู้ใช้กดเปิดกล้องเองจะเสถียรกว่ามากในบางเครื่อง
+  // ✅ มาตรฐาน: ขอ permission เฉพาะจาก user gesture (กดปุ่ม)
   startButton.addEventListener('click', async () => {
-    await initCameras();                 // โหลดรายการ (หลัง permission)
-    await startCamera(cameraSelect.value || currentDeviceId);
+    if (starting) return;
+    starting = true;
+    try {
+      await startFlow_();
+    } finally {
+      starting = false;
+    }
   });
 
   stopButton.addEventListener('click', () => stopCamera());
 
-  // โหลดรายการกล้องไว้ก่อน (ถ้าเครื่องรองรับ)
-  initCameras().catch(()=>{});
+  // สลับกล้อง: stop ก่อน แล้วค่อย start ใหม่ (ไม่ขอ permission ซ้ำถ้า granted แล้ว)
+  cameraSelect.addEventListener('change', async () => {
+    if (!cameraStarted) return;
+    await restartWithDevice_(cameraSelect.value);
+  });
 
-  // ====== Camera helpers ======
+  // ======== Permission / Device =========
+
+  async function queryCameraPermission_() {
+    // permissions API ไม่รองรับทุกเบราว์เซอร์ → fallback unknown
+    try {
+      if (!navigator.permissions?.query) return "unknown";
+      const p = await navigator.permissions.query({ name: "camera" });
+      permissionState = p.state || "unknown";
+      // ติดตามการเปลี่ยน state
+      try {
+        p.onchange = () => { permissionState = p.state || "unknown"; };
+      } catch (_) {}
+      return permissionState;
+    } catch (_) {
+      return "unknown";
+    }
+  }
+
+  async function listVideoDevices_() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter(d => d.kind === "videoinput");
+  }
 
   function isMobile_() {
     return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   }
 
-  // ขอ permission กล้องแบบเบา ๆ (สำคัญสำหรับ iOS/Safari)
-  async function ensureCameraPermission_() {
-    try {
-      const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      tmp.getTracks().forEach(t => t.stop());
-      return true;
-    } catch (e) {
-      return false;
+  function pickDefaultDevice_(devices) {
+    if (!devices?.length) return "";
+    if (isMobile_()) {
+      // หลัง permission แล้ว label มักมี back/rear
+      const back = devices.find(d => /back|rear|environment/i.test(d.label || ""));
+      return (back?.deviceId) || devices[0].deviceId;
     }
+    return devices[0].deviceId;
   }
 
-  async function loadDeviceList_() {
-    // 1) ลองของ ZXing ก่อน
-    try {
-      const devices = await ZXing.BrowserQRCodeReader.listVideoInputDevices();
-      if (devices && devices.length) return devices;
-    } catch (_) {}
-
-    // 2) fallback: enumerateDevices
-    const all = await navigator.mediaDevices.enumerateDevices();
-    return all.filter(d => d.kind === 'videoinput');
-  }
-
-  async function initCameras() {
-    if (!navigator.mediaDevices?.getUserMedia) return;
-
-    // iOS/Safari ต้องขอ permission ก่อนถึงเห็น label/deviceId ดี ๆ
-    await ensureCameraPermission_();
-
-    const devices = await loadDeviceList_();
+  async function refreshCameraSelect_() {
+    const cams = await listVideoDevices_();
 
     cameraSelect.innerHTML = "";
-    devices.forEach((d, idx) => {
-      const opt = document.createElement('option');
+    cams.forEach((d, idx) => {
+      const opt = document.createElement("option");
       opt.value = d.deviceId || "";
-      opt.innerText = d.label || `Camera ${idx + 1}`;
+      opt.textContent = d.label || `Camera ${idx + 1}`;
       cameraSelect.appendChild(opt);
     });
 
-    // เลือกกล้องหลัง
-    if (isMobile_() && devices.length) {
-      const back = devices.find(d => /back|rear|environment/i.test(d.label || ''));
-      currentDeviceId = (back?.deviceId) || (devices[0].deviceId || "");
-    } else {
-      currentDeviceId = devices[0]?.deviceId || "";
-    }
-
+    const def = pickDefaultDevice_(cams);
+    if (!currentDeviceId) currentDeviceId = def;
     if (currentDeviceId) cameraSelect.value = currentDeviceId;
-
-    // สลับกล้องต้อง stop ก่อน (แก้บางเครื่องเปิดไม่ติด)
-    cameraSelect.onchange = async () => {
-      await stopCamera();
-      await startCamera(cameraSelect.value);
-    };
   }
 
-  async function startCamera(selectedDeviceId) {
-    const deviceId = selectedDeviceId || currentDeviceId || "";
+  // ======== Camera start flow (Modern Standard) =========
+  async function startFlow_() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      return Swal.fire({ icon:'error', title:'ไม่รองรับกล้อง', text:'เบราว์เซอร์นี้ไม่รองรับ getUserMedia', confirmButtonText:'OK' });
+    }
 
-    // ป้องกันเปิดซ้อน
-    if (cameraStarted) return;
+    // 1) ตรวจ permission state (ถ้ารองรับ)
+    const p = await queryCameraPermission_();
 
-    // stop เก่าถ้ามี
-    if (activeStream) await stopCamera();
+    // 2) ถ้า denied → บอกวิธีเปิดสิทธิ์ (อย่าพยายามเรียก getUserMedia ซ้ำ จะเด้ง/ล้มเหลว)
+    if (p === "denied") {
+      return Swal.fire({
+        icon: 'warning',
+        title: 'ไม่ได้รับอนุญาตใช้กล้อง',
+        html: `
+          <div style="text-align:left;font-size:14px">
+            กรุณาอนุญาตกล้องในการตั้งค่าเบราว์เซอร์/โทรศัพท์ แล้วลองใหม่<br><br>
+            • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
+            • Android: Site settings → Camera → Allow<br><br>
+            จากนั้นกลับมากด “เปิดกล้อง” อีกครั้ง
+          </div>
+        `,
+        confirmButtonText: 'OK',
+        allowOutsideClick: false
+      });
+    }
+
+    // 3) ถ้าเคยมี stream แล้วและยังใช้งานได้ → ไม่ขอ permission ใหม่ (กันเด้งซ้ำ)
+    if (activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
+      cameraStarted = true;
+      try { await refreshCameraSelect_(); } catch (_) {}
+      decodeLoop_(currentDeviceId || null);
+      return;
+    }
+
+    // 4) ขอ stream “ครั้งเดียว” (permission prompt จะขึ้นเฉพาะครั้งนี้)
+    //    ใช้ fallback แบบมาตรฐาน: deviceId(ถ้ามี) → facingMode → video:true
+    await openCameraOnce_();
+
+    // 5) หลังได้ permission แล้ว ค่อย refresh รายชื่อกล้อง (label/deviceId จะมาเต็ม)
+    try { await refreshCameraSelect_(); } catch (_) {}
 
     cameraStarted = true;
+    decodeLoop_(currentDeviceId || null);
+  }
+
+  async function openCameraOnce_() {
+    // ปิดก่อนเผื่อค้าง
+    await stopCamera();
 
     const tryOpen = async (constraints) => {
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      qrVideo.srcObject = stream;
       activeStream = stream;
+      qrVideo.srcObject = stream;
       await qrVideo.play();
-      return stream;
+      return true;
     };
 
-    try {
-      // Try 1: exact deviceId
-      if (deviceId) {
+    const wantDeviceId = cameraSelect.value || currentDeviceId || "";
+
+    // Try 1: exact deviceId (ถ้ามี)
+    if (wantDeviceId) {
+      try {
         await tryOpen({
           audio: false,
           video: {
-            deviceId: { exact: deviceId },
+            deviceId: { exact: wantDeviceId },
             width: { ideal: 1280 },
             height: { ideal: 720 },
             frameRate: { ideal: 30, max: 30 }
           }
         });
-        currentDeviceId = deviceId;
-      } else {
-        throw new Error("no deviceId");
-      }
-    } catch (e1) {
-      try {
-        // Try 2: ideal deviceId
-        if (deviceId) {
-          await tryOpen({
-            audio: false,
-            video: {
-              deviceId: { ideal: deviceId },
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            }
-          });
-          currentDeviceId = deviceId;
-        } else {
-          throw new Error("no deviceId");
-        }
-      } catch (e2) {
-        try {
-          // Try 3: facingMode environment (มือถือที่เลือกกล้องไม่ได้)
-          await tryOpen({
-            audio: false,
-            video: {
-              facingMode: { ideal: "environment" },
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            }
-          });
-        } catch (e3) {
-          try {
-            // Try 4: video:true (ให้ browser เลือกกล้องให้)
-            await tryOpen({ video: true, audio: false });
-          } catch (e4) {
-            cameraStarted = false;
-            console.error("startCamera failed:", e1, e2, e3, e4);
-            Swal.fire({
-              icon: 'error',
-              title: 'เปิดกล้องไม่สำเร็จ',
-              html: `
-                <div style="text-align:left;font-size:14px">
-                  สาเหตุที่พบบ่อย:<br>
-                  • ยังไม่อนุญาตสิทธิ์กล้อง (Allow)<br>
-                  • เปิดผ่าน in-app browser (LINE/FB) ที่บล็อกกล้อง<br>
-                  • มีแอป/แท็บอื่นใช้กล้องอยู่<br><br>
-                  แนะนำ:<br>
-                  1) เปิดลิงก์ด้วย Chrome/Safari โดยตรง<br>
-                  2) ปิดแท็บอื่นที่ใช้กล้อง<br>
-                  3) กด “เปิดกล้อง” อีกครั้ง
-                </div>
-              `,
-              confirmButtonText: 'OK',
-              allowOutsideClick: false
-            });
-            return;
-          }
-        }
-      }
+        currentDeviceId = wantDeviceId;
+        return;
+      } catch (_) {}
     }
 
-    // หลังเปิดได้แล้ว: รีโหลด device list อีกที (เพื่อให้ label มาเต็ม)
-    try { await initCameras(); } catch (_) {}
+    // Try 2: facingMode environment (มือถือ)
+    try {
+      await tryOpen({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      });
+      return;
+    } catch (_) {}
 
-    // เริ่ม decode ต่อเนื่อง
-    decodeLoop(currentDeviceId || null);
+    // Try 3: video:true (ให้ browser เลือกเอง)
+    try {
+      await tryOpen({ video: true, audio: false });
+      return;
+    } catch (err) {
+      console.error("openCameraOnce_ failed:", err);
+      throw err;
+    }
+  }
+
+  async function restartWithDevice_(deviceId) {
+    currentDeviceId = deviceId || currentDeviceId || "";
+    try {
+      await openCameraOnce_();          // เปิดใหม่ครั้งเดียว
+      cameraStarted = true;
+      decodeLoop_(currentDeviceId || null);
+    } catch (err) {
+      cameraStarted = false;
+      Swal.fire({
+        icon: 'error',
+        title: 'สลับกล้องไม่สำเร็จ',
+        text: 'ลองปิดกล้องแล้วเปิดใหม่ หรือเลือกกล้องอีกครั้ง',
+        confirmButtonText: 'OK'
+      });
+    }
   }
 
   async function stopCamera() {
@@ -218,8 +233,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try { codeReader.reset(); } catch (_) {}
 
-    if (activeStream && activeStream.getTracks) {
-      activeStream.getTracks().forEach(t => t.stop());
+    if (activeStream) {
+      try { activeStream.getTracks().forEach(t => t.stop()); } catch (_) {}
     }
     activeStream = null;
 
@@ -227,7 +242,7 @@ document.addEventListener('DOMContentLoaded', () => {
     qrVideo.srcObject = null;
   }
 
-  function decodeLoop(deviceIdOrNull) {
+  function decodeLoop_(deviceIdOrNull) {
     try { codeReader.reset(); } catch (_) {}
 
     codeReader.decodeFromVideoDevice(deviceIdOrNull, qrVideo, async (result, err) => {
@@ -265,7 +280,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       const res = await gasJsonp({ action: "search", query });
-
       if (!res || !res.ok) throw new Error(res?.error || "API Error");
 
       const htmlString = res.html || "";
@@ -282,7 +296,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // ไฮไลต์ Timestamp/Out
+      // highlight
       const parser = new DOMParser();
       const doc = parser.parseFromString(htmlString, 'text/html');
       const rows = doc.getElementsByTagName('tr');
@@ -323,8 +337,9 @@ document.addEventListener('DOMContentLoaded', () => {
         allowOutsideClick:false
       });
 
+      // auto restart only if camera is off (avoid repeated permission prompts)
       setTimeout(() => {
-        if (!cameraStarted && currentDeviceId) startCamera(currentDeviceId);
+        if (!cameraStarted && permissionState !== "denied") startFlow_().catch(()=>{});
       }, AUTO_RESTART_MS);
     }
   }
