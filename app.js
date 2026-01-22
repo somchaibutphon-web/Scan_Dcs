@@ -2,7 +2,7 @@
 // ตั้งค่า URL ของ Apps Script Web App (ลงท้ายด้วย /exec)
 // ตัวอย่าง: https://script.google.com/macros/s/AKfycbx.../exec
 // =============================
-const GAS_WEBAPP_URL = "PUT_YOUR_WEBAPP_EXEC_URL_HERE";
+const GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxTalJy8NES5PwLMqBgKtpAB9-QvqNIfIyWpm7oXzz0fcOETzrCUD28UgritPz5ZT7TDA/exec";
 
 document.addEventListener('DOMContentLoaded', () => {
   const searchInput   = document.getElementById('searchInput');
@@ -219,3 +219,4 @@ document.addEventListener('DOMContentLoaded', () => {
     if (s) { s.volume = 1.0; s.play().catch(()=>{}); }
   }
 });
+
