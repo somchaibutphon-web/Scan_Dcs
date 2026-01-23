@@ -7,7 +7,6 @@ const GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxTalJy8NES5PwLM
 const SCAN_COOLDOWN_MS   = 800;
 const SAME_CODE_HOLD_MS  = 1800;
 const API_LOCK_TIMEOUT   = 15000;
-const AUTO_RESTART_MS    = 1200;
 
 // ✅ Auto-stop camera if idle
 const CAMERA_IDLE_TIMEOUT_MS = 30000; // 30s
@@ -30,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // ========= State =========
   let currentDeviceId = "";
   let cameraStarted = false;
+  let decoding = false;
   let apiBusy = false;
 
   let lastScanAt = 0;
@@ -37,29 +37,31 @@ document.addEventListener('DOMContentLoaded', () => {
   let lastTextAt = 0;
 
   let activeStream = null;
-  let starting = false;
 
-  // decode control
-  let decoding = false;
+  // ✅ กันเปิดซ้อน + กัน permission เด้งซ้ำ
+  let starting = false;          // กันกดเปิดกล้องซ้อน
+  let cameraSessionLocked = false; // ถ้าเปิดสำเร็จแล้ว จะไม่เรียก getUserMedia ซ้ำจนกว่าจะ stop
+
+  // ✅ ถ้า user เคย deny จริง เราจะไม่พยายามเด้งซ้ำ
+  let hardDenied = false;
 
   // ✅ Idle timer
   let idleTimer = null;
-  function bumpIdle_() {
+  function bumpIdle_(reason = "") {
     if (!cameraStarted) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      // ถ้าไม่มี activity 30 วิ ให้ปิดกล้องเอง
       stopCamera(true);
     }, CAMERA_IDLE_TIMEOUT_MS);
   }
 
-  // ========= Toast (SweetAlert2) =========
+  // ========= Toast =========
   const Toast = Swal.mixin({
     toast: true,
     position: 'top-end',
     showConfirmButton: false,
     showCloseButton: true,
-    timer: 5200,
+    timer: 6000,
     timerProgressBar: true,
     didOpen: (toast) => {
       toast.addEventListener('mouseenter', Swal.stopTimer);
@@ -74,75 +76,45 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/'/g,'&#039;');
   }
 
-  function showToastScanFull(data) {
-    // data: { autoId, tsIn, dc, dcName, fullName, gender, company, phone, tsOut, duration }
+  function toastInfo(title, html, ms=4200){
+    bumpIdle_("toast");
+    Toast.fire({ icon:'info', title: `<b>${esc(title)}</b>`, html, timer: ms });
+  }
+  function toastOk(title, html, ms=5200){
+    bumpIdle_("toast");
+    Toast.fire({ icon:'success', title: `<b>${esc(title)}</b>`, html, timer: ms });
+  }
+  function toastWarn(title, html, ms=5200){
+    bumpIdle_("toast");
+    Toast.fire({ icon:'warning', title: `<b>${esc(title)}</b>`, html, timer: ms });
+  }
+  function toastErr(title, html, ms=6500){
+    bumpIdle_("toast");
+    Toast.fire({ icon:'error', title: `<b>${esc(title)}</b>`, html, timer: ms });
+  }
+
+  function showScanToast(data){
+    // data: {autoId, tsIn, dc, dcName, fullName, gender, company, phone, tsOut, duration}
     const lines = [
       data.tsIn ? `Timestamp: ${data.tsIn}` : null,
-      data.tsOut ? `Timestamp Out: ${data.tsOut}` : null,
-      data.duration ? `Duration: ${data.duration}` : null,
       (data.dc || data.dcName) ? `DC: ${data.dc || ''}${data.dcName ? ' - ' + data.dcName : ''}` : null,
       data.fullName ? `ชื่อ: ${data.fullName}` : null,
-      data.gender ? `เพศ: ${data.gender}` : null,
       data.company ? `บริษัท: ${data.company}` : null,
-      data.phone ? `เบอร์โทร: ${data.phone}` : null,
+      data.phone ? `โทร: ${data.phone}` : null,
+      data.tsOut ? `Timestamp Out: ${data.tsOut}` : null,
+      data.duration ? `Duration: ${data.duration}` : null,
     ].filter(Boolean);
 
-    // โชว์ไม่เกิน 6 บรรทัด (ไม่ล้นจอ)
-    const showLines = lines.slice(0, 6).map(x =>
-      `<div style="font-size:12px;line-height:1.25;opacity:.95">${esc(x)}</div>`
-    ).join('');
+    const show = lines.slice(0, 6).map(x => `<div style="font-size:12px;line-height:1.25;opacity:.95">${esc(x)}</div>`).join('');
+    const more = Math.max(0, lines.length - 6);
 
-    const extraCount = Math.max(0, lines.length - 6);
-
-    Toast.fire({
-      icon: 'success',
-      title: `
-        <div style="font-size:14px;font-weight:900;line-height:1.2">
-          บันทึกสำเร็จ
-        </div>
-      `,
-      html: `
-        <div style="text-align:left;min-width:260px;max-width:360px">
-          <div style="font-size:12px;opacity:.85;margin-top:2px">
-            <b>Auto ID:</b> ${esc(data.autoId || '-')}
-          </div>
-          ${showLines ? `<div style="margin-top:6px">${showLines}</div>` : ''}
-          ${
-            extraCount
-              ? `<div style="margin-top:6px;font-size:11px;opacity:.75">+ ข้อมูลเพิ่มอีก ${extraCount} รายการ</div>`
-              : ''
-          }
-        </div>
-      `
-    });
-  }
-
-  function showToastNotFound(autoId){
-    Toast.fire({
-      icon: 'warning',
-      title: `<div style="font-size:14px;font-weight:900">ไม่พบข้อมูล</div>`,
-      html: `
-        <div style="text-align:left;min-width:260px;max-width:360px">
-          <div style="font-size:12px;opacity:.9"><b>Auto ID:</b> ${esc(autoId || '-')}</div>
-          <div style="margin-top:6px;font-size:12px;opacity:.85">กรุณาตรวจสอบอีกครั้ง</div>
-        </div>
-      `,
-      timer: 5200
-    });
-  }
-
-  function showToastError(autoId, msg){
-    Toast.fire({
-      icon: 'error',
-      title: `<div style="font-size:14px;font-weight:900">เกิดข้อผิดพลาด</div>`,
-      html: `
-        <div style="text-align:left;min-width:260px;max-width:360px">
-          <div style="font-size:12px;opacity:.9"><b>Auto ID:</b> ${esc(autoId || '-')}</div>
-          <div style="margin-top:6px;font-size:12px;opacity:.85">${esc(msg || '')}</div>
-        </div>
-      `,
-      timer: 6500
-    });
+    toastOk(
+      `บันทึกสำเร็จ • ${data.autoId || '-'}`,
+      `<div style="text-align:left;min-width:260px;max-width:360px">
+        ${show ? `<div style="margin-top:4px">${show}</div>` : ''}
+        ${more ? `<div style="margin-top:6px;font-size:11px;opacity:.75">+ เพิ่มอีก ${more} รายการ</div>` : ''}
+      </div>`
+    );
   }
 
   // ========= UX =========
@@ -150,25 +122,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
   searchInput.addEventListener('input', () => {
     searchInput.value = searchInput.value.toUpperCase();
-    bumpIdle_();
+    bumpIdle_("typing");
   });
 
   searchBtn.addEventListener('click', () => {
-    bumpIdle_();
+    bumpIdle_("searchBtn");
     runSearch(searchInput.value);
   });
 
   searchInput.addEventListener('keyup', (e) => {
-    bumpIdle_();
+    bumpIdle_("typing");
     if (e.key === 'Enter') runSearch(searchInput.value);
   });
 
-  // ✅ ขอ permission เฉพาะจาก user gesture
   startButton.addEventListener('click', async () => {
     if (starting) return;
     starting = true;
     try {
-      await startFlow_();
+      await startCameraFlow_();
     } finally {
       starting = false;
     }
@@ -178,12 +149,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   cameraSelect.addEventListener('change', async () => {
     if (!cameraStarted) return;
-    bumpIdle_();
+    bumpIdle_("changeCam");
+    // ✅ สลับกล้อง = stop แล้วค่อย open ใหม่ (แต่ยังกัน permission เด้งด้วย lock)
     await restartWithDevice_(cameraSelect.value);
   });
 
-  // ======== helpers ========
-
+  // ========= Helpers =========
   function isMobile_() {
     return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   }
@@ -191,16 +162,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function isInAppBrowser_() {
     const ua = navigator.userAgent || "";
     return /Line|FBAN|FBAV|Instagram/i.test(ua);
-  }
-
-  async function queryCameraPermission_() {
-    try {
-      if (!navigator.permissions?.query) return "unknown";
-      const p = await navigator.permissions.query({ name: "camera" });
-      return p.state || "unknown";
-    } catch (_) {
-      return "unknown";
-    }
   }
 
   async function listVideoDevices_() {
@@ -218,9 +179,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function refreshCameraSelect_() {
+    // NOTE: label จะมาเต็มหลัง permission
     const cams = await listVideoDevices_();
-
     cameraSelect.innerHTML = "";
+
     cams.forEach((d, idx) => {
       const opt = document.createElement("option");
       opt.value = d.deviceId || "";
@@ -235,79 +197,87 @@ document.addEventListener('DOMContentLoaded', () => {
     cameraSelect.style.display = (cams.length <= 1) ? "none" : "block";
   }
 
-  // ======== Camera flow ========
-
-  async function startFlow_() {
+  // ========= Main Flow =========
+  async function startCameraFlow_() {
     if (!navigator.mediaDevices?.getUserMedia) {
-      return Swal.fire({
-        icon:'error',
-        title:'ไม่รองรับกล้อง',
-        text:'เบราว์เซอร์นี้ไม่รองรับการใช้งานกล้อง',
-        confirmButtonText:'OK'
-      });
+      await Swal.fire({ icon:'error', title:'ไม่รองรับกล้อง', text:'เบราว์เซอร์นี้ไม่รองรับการใช้งานกล้อง', confirmButtonText:'OK' });
+      return;
     }
 
-    // ลดปัญหา permission ใน in-app browser
-    if (isInAppBrowser_()) {
+    if (hardDenied) {
       await Swal.fire({
-        icon: 'info',
-        title: 'แนะนำให้เปิดด้วย Chrome/Safari',
-        html: `<div style="font-size:14px;text-align:left">
-          บางเครื่องเมื่อเปิดผ่าน LINE/FB/IG จะขออนุญาตซ้ำหรือเปิดกล้องไม่ได้<br>
-          แนะนำ: เปิดลิงก์นี้ด้วย Chrome/Safari โดยตรง หรือ “Add to Home Screen” (PWA)
+        icon:'warning',
+        title:'สิทธิ์กล้องถูกปฏิเสธ',
+        html:`<div style="text-align:left;font-size:14px">
+          ระบบตรวจพบว่าเคยกด “ไม่อนุญาต” กล้องไว้<br>
+          กรุณาไปเปิดสิทธิ์กล้องในตั้งค่าเบราว์เซอร์/โทรศัพท์ก่อน แล้วค่อยกลับมากด “เปิดกล้อง” อีกครั้ง
         </div>`,
-        confirmButtonText: 'เข้าใจแล้ว'
+        confirmButtonText:'OK',
+        allowOutsideClick:false
       });
+      return;
     }
 
-    // ถ้ายัง live อยู่ → ไม่ขอใหม่
-    if (activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
+    // เตือน in-app browser (บล็อก permission / เลือกกล้องไม่ได้)
+    if (isInAppBrowser_()) {
+      toastInfo("แนะนำ", `<div style="text-align:left;font-size:12px">
+        ถ้าเปิดผ่าน LINE/FB/IG บางรุ่นจะเด้งขออนุญาตซ้ำ/เลือกกล้องไม่ได้<br>
+        แนะนำเปิดด้วย Chrome/Safari หรือ Add to Home Screen
+      </div>`, 5200);
+    }
+
+    // ✅ ถ้า session lock และ stream ยัง live → ไม่เรียก getUserMedia ซ้ำ (แก้เด้ง permission)
+    if (cameraSessionLocked && activeStream && activeStream.getTracks().some(t => t.readyState === "live")) {
       cameraStarted = true;
-      bumpIdle_();
+      bumpIdle_("resume");
       resumeDecode_();
       return;
     }
 
-    const p = await queryCameraPermission_();
-    if (p === "denied") {
-      return Swal.fire({
-        icon: 'warning',
-        title: 'ไม่ได้รับอนุญาตใช้กล้อง',
-        html: `<div style="text-align:left;font-size:14px">
-          กรุณาอนุญาตกล้องในการตั้งค่า แล้วกลับมากด “เปิดกล้อง” อีกครั้ง<br><br>
-          • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
-          • Android: Site settings → Camera → Allow
-        </div>`,
-        confirmButtonText: 'OK',
-        allowOutsideClick: false
-      });
-    }
-
+    // เปิดกล้องจริง (ครั้งเดียวต่อ session จน stop)
     try {
       await openCameraOnce_();
+      cameraSessionLocked = true; // ✅ lock เมื่อเปิดสำเร็จ
     } catch (err) {
-      console.error(err);
       const name = err?.name || "CameraError";
-      let msg = "ไม่สามารถเปิดกล้องได้";
+      console.error(err);
 
-      if (name === "NotAllowedError") msg = "คุณกดไม่อนุญาตกล้อง หรือระบบบล็อกสิทธิ์กล้อง";
-      if (name === "NotFoundError")  msg = "ไม่พบกล้องในอุปกรณ์นี้";
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        // ✅ ถือว่า hardDenied เพื่อไม่เด้งซ้ำ
+        hardDenied = true;
+        await Swal.fire({
+          icon:'warning',
+          title:'ไม่ได้รับอนุญาตใช้กล้อง',
+          html:`<div style="text-align:left;font-size:14px">
+            กรุณาอนุญาตกล้องในการตั้งค่า แล้วลองใหม่<br><br>
+            • iPhone: Settings → Safari/Chrome → Camera → Allow<br>
+            • Android: Site settings → Camera → Allow
+          </div>`,
+          confirmButtonText:'OK',
+          allowOutsideClick:false
+        });
+        return;
+      }
+
+      let msg = "ไม่สามารถเปิดกล้องได้";
+      if (name === "NotFoundError") msg = "ไม่พบกล้องในอุปกรณ์นี้";
       if (name === "NotReadableError") msg = "กล้องถูกใช้งานโดยแอปอื่นอยู่ (ปิดแอป/แท็บอื่นก่อน)";
       if (name === "OverconstrainedError") msg = "เลือกกล้อง/ความละเอียดที่อุปกรณ์ไม่รองรับ";
 
-      return Swal.fire({ icon:'error', title:'เปิดกล้องไม่สำเร็จ', text: msg, confirmButtonText:'OK' });
+      await Swal.fire({ icon:'error', title:'เปิดกล้องไม่สำเร็จ', text: msg, confirmButtonText:'OK' });
+      return;
     }
 
-    // หลังได้ permission แล้ว refresh list เพื่อ label เต็ม
+    // หลังได้ permission แล้ว refresh list
     try { await refreshCameraSelect_(); } catch (_) {}
 
     cameraStarted = true;
-    bumpIdle_();
+    bumpIdle_("start");
     resumeDecode_();
+    toastInfo("กล้องพร้อมใช้งาน", `<div style="font-size:12px;text-align:left">สแกนต่อเนื่องได้เลย (จะปิดอัตโนมัติถ้าไม่ใช้งาน 30 วินาที)</div>`, 2800);
   }
 
   async function openCameraOnce_() {
-    // ปิดก่อนเผื่อค้าง (fromIdle=true เพื่อไม่ขึ้น dialog)
     await stopCamera(true);
 
     const tryOpen = async (constraints) => {
@@ -320,7 +290,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const wantDeviceId = cameraSelect.value || currentDeviceId || "";
 
-    // Try 1: exact deviceId
+    // ✅ ลำดับ fallback ที่ “ปลอดภัย” สำหรับหลายรุ่น
+    // 1) exact deviceId
     if (wantDeviceId) {
       try {
         await tryOpen({
@@ -337,7 +308,7 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (_) {}
     }
 
-    // Try 2: environment
+    // 2) facingMode environment (mobile)
     try {
       await tryOpen({
         audio: false,
@@ -350,25 +321,23 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     } catch (_) {}
 
-    // Try 3: browser choose
+    // 3) let browser choose
     await tryOpen({ video: true, audio: false });
   }
 
   async function restartWithDevice_(deviceId) {
+    // สลับกล้อง = เปิดใหม่หนึ่งครั้ง (lock ยังอยู่)
     currentDeviceId = deviceId || currentDeviceId || "";
     try {
+      // ระวัง: บางเครื่องสลับแล้วเด้ง permission ถ้าเราขอใหม่รัว → ทำแบบ stop/open ครั้งเดียวพอ
       await openCameraOnce_();
+      cameraSessionLocked = true;
       cameraStarted = true;
-      bumpIdle_();
+      bumpIdle_("restart");
       resumeDecode_();
     } catch (err) {
       cameraStarted = false;
-      Swal.fire({
-        icon: 'error',
-        title: 'สลับกล้องไม่สำเร็จ',
-        text: 'ลองปิดกล้องแล้วเปิดใหม่ หรือเลือกกล้องอีกครั้ง',
-        confirmButtonText: 'OK'
-      });
+      toastErr("สลับกล้องไม่สำเร็จ", `<div style="font-size:12px;text-align:left">ลองปิดกล้องแล้วเปิดใหม่ หรือเลือกกล้องอีกครั้ง</div>`);
     }
   }
 
@@ -389,20 +358,15 @@ document.addEventListener('DOMContentLoaded', () => {
     try { qrVideo.pause(); } catch (_) {}
     qrVideo.srcObject = null;
 
+    // ✅ ปลด lock เมื่อ stop จริงเท่านั้น (เพื่อไม่เรียก getUserMedia ซ้ำแบบงงๆ)
+    cameraSessionLocked = false;
+
     if (fromIdle) {
-      Toast.fire({
-        icon: 'info',
-        title: `<div style="font-size:14px;font-weight:900">ปิดกล้องอัตโนมัติ</div>`,
-        html: `<div style="text-align:left;min-width:260px;max-width:360px;font-size:12px;opacity:.9">
-          ไม่มีการใช้งานเกิน 30 วินาที ระบบปิดกล้องให้เพื่อประหยัดแบตเตอรี่
-        </div>`,
-        timer: 2200
-      });
+      toastInfo("ปิดกล้องอัตโนมัติ", `<div style="font-size:12px;text-align:left">ไม่มีการใช้งานเกิน 30 วินาที ระบบปิดกล้องให้เพื่อประหยัดแบตเตอรี่</div>`, 2600);
     }
   }
 
-  // ======== Decode control (pause/resume) ========
-
+  // ========= Decode =========
   function pauseDecode_() {
     decoding = false;
     try { codeReader.reset(); } catch (_) {}
@@ -422,9 +386,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!decoding) return;
       if (!result) return;
 
-      bumpIdle_(); // มี activity
-
+      bumpIdle_("scan");
       const now = Date.now();
+
       if (apiBusy) return;
       if (now - lastScanAt < SCAN_COOLDOWN_MS) return;
 
@@ -439,7 +403,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       playScanSound();
 
-      // ✅ นิ่งสุด: พัก decode ระหว่างทำงาน แล้วค่อย resume
+      // ✅ พัก decode ระหว่างยิง API แล้วกลับมาสแกนต่อ
       apiBusy = true;
       pauseDecode_();
 
@@ -447,14 +411,13 @@ document.addEventListener('DOMContentLoaded', () => {
         await runSearch(text);
       } finally {
         apiBusy = false;
-        bumpIdle_();
-        // กลับมาสแกนต่อทันที
+        bumpIdle_("afterApi");
         resumeDecode_();
       }
     });
   }
 
-  // ====== Search / GAS JSONP ======
+  // ========= GAS JSONP =========
   async function runSearch(query) {
     query = String(query || "").trim().toUpperCase();
     if (!query) return;
@@ -466,12 +429,12 @@ document.addEventListener('DOMContentLoaded', () => {
       const htmlString = res.html || "";
       if (!htmlString) {
         playErrorSound();
-        showToastNotFound(query);
+        toastWarn("ไม่พบข้อมูล", `<div style="font-size:12px;text-align:left"><b>Auto ID:</b> ${esc(query)}<br>กรุณาตรวจสอบอีกครั้ง</div>`);
         searchInput.value = '';
         return;
       }
 
-      // ===== parse ตาราง th/td =====
+      // แปลงตารางเป็น map
       const parser = new DOMParser();
       const doc = parser.parseFromString(htmlString, 'text/html');
       const rows = Array.from(doc.querySelectorAll('tr'));
@@ -486,7 +449,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (k) map[k] = v;
       });
 
-      // ===== map ตามฟิลด์ของคุณ =====
+      // map ตามหัวตารางของคุณ
       const data = {
         autoId: map['Auto ID'] || query,
         tsIn: map['Timestamp'] || '',
@@ -500,18 +463,13 @@ document.addEventListener('DOMContentLoaded', () => {
         duration: map['Duration'] || ''
       };
 
-      showToastScanFull(data);
+      showScanToast(data);
       searchInput.value = '';
 
     } catch (err) {
       console.error(err);
       playErrorSound();
-      showToastError(query, String(err?.message || err));
-
-      // auto restart decode (ไม่ reopen camera เพื่อกัน prompt ซ้ำ)
-      setTimeout(() => {
-        if (cameraStarted) resumeDecode_();
-      }, AUTO_RESTART_MS);
+      toastErr("Error", `<div style="font-size:12px;text-align:left"><b>Auto ID:</b> ${esc(query)}<br>${esc(String(err?.message || err))}</div>`);
     }
   }
 
@@ -566,7 +524,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const s = document.getElementById('scanSound');
     if (s) { s.volume = 1.0; s.play().catch(()=>{}); }
   }
-
   function playErrorSound() {
     const s = document.getElementById('errorSound');
     if (s) { s.volume = 1.0; s.play().catch(()=>{}); }
