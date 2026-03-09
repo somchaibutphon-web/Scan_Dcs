@@ -3136,63 +3136,97 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function runSearch(query) {
-    query = normalizeCode_(query);
-    if (!query) return;
+  query = String(query || "").trim().toUpperCase();
+  if (!query) return;
 
-    bumpIdle_();
-    const reqId = ++currentRequestId;
-    setCameraStatus("กำลังค้นหา...", "loading");
+  bumpIdle_();
+  const reqId = ++currentRequestId;
+  setCameraStatus("กำลังค้นหา...", "loading");
 
-    try {
-      const res = await gasJsonpWithRetry({ action: "search", query }, MAX_API_RETRY);
-      if (reqId !== currentRequestId) return;
+  try {
+    const res = await gasJsonpWithRetry({ action: "search", query }, 1);
+    if (reqId !== currentRequestId) return;
 
-      console.log("API response:", res);
+    console.log("API response:", res);
 
-      if (!res || typeof res !== "object") {
-        throw new Error("รูปแบบข้อมูลตอบกลับไม่ถูกต้อง");
+    if (!res || typeof res !== "object") {
+      throw new Error("รูปแบบข้อมูลตอบกลับไม่ถูกต้อง");
+    }
+
+    // -------------------------------
+    // อ่านสถานะแบบทนทาน
+    // -------------------------------
+    const rawStatus =
+      res.status ??
+      res.data?.status ??
+      res.result?.status ??
+      "";
+
+    const status = String(rawStatus || "").trim().toLowerCase();
+    const ok = res.ok === true;
+
+    // success แบบยืดหยุ่น:
+    // - status === success
+    // - หรือ ok=true และมี record กลับมา
+    const record =
+      res.data?.record ||
+      res.record ||
+      res.data ||
+      {};
+
+    const hasRecord =
+      record &&
+      typeof record === "object" &&
+      Object.keys(record).length > 0;
+
+    const isSuccess =
+      status === "success" ||
+      (ok && hasRecord && status !== "duplicate" && status !== "not_found" && status !== "error");
+
+    const isDuplicate =
+      status === "duplicate";
+
+    const isNotFound =
+      status === "not_found";
+
+    if (isSuccess) {
+      showResult(record, res.detail || "บันทึกสำเร็จ");
+      setCameraStatus("บันทึกสำเร็จ", "success");
+
+      await Swal.fire({
+        icon: 'success',
+        title: res.title || 'บันทึกสำเร็จ',
+        text: res.detail || 'บันทึกเวลาออกเรียบร้อยแล้ว',
+        confirmButtonText: 'ตกลง',
+        allowOutsideClick: false,
+        timer: 2200
+      });
+
+      searchInput.value = '';
+      return;
+    }
+
+    if (isDuplicate) {
+      playErrorSound();
+      setCameraStatus("พบข้อมูลซ้ำ", "warning");
+
+      if (hasRecord) {
+        showResult(record, res.detail || "ข้อมูลนี้ออกระบบแล้ว");
       }
 
-      const status = String(res.status || "").toLowerCase();
+      await Swal.fire({
+        icon: 'warning',
+        title: res.title || 'บันทึกซ้ำไม่ได้',
+        text: res.detail || 'ข้อมูลนี้ออกระบบแล้ว',
+        confirmButtonText: 'ตกลง',
+        allowOutsideClick: false
+      });
 
-      if (status === "success") {
-        const record = res.data?.record || {};
-        showResult(record, res.detail || "บันทึกสำเร็จ");
-        setCameraStatus("บันทึกสำเร็จ", "success");
+      searchInput.value = '';
+      return;
+    }
 
-        await Swal.fire({
-          icon: 'success',
-          title: res.title || 'บันทึกสำเร็จ',
-          text: res.detail || 'บันทึกเวลาออกเรียบร้อยแล้ว',
-          confirmButtonText: 'ตกลง',
-          allowOutsideClick: false,
-          timer: 2200
-        });
-
-        searchInput.value = '';
-        return;
-      }
-
-      if (status === "duplicate") {
-        playErrorSound();
-        setCameraStatus("พบข้อมูลซ้ำ", "warning");
-
-        if (res.data?.record) {
-          showResult(res.data.record, res.detail || "ข้อมูลนี้ออกระบบแล้ว");
-        }
-
-        await Swal.fire({
-          icon: 'warning',
-          title: res.title || 'บันทึกซ้ำไม่ได้',
-          text: res.detail || 'ข้อมูลนี้ออกระบบแล้ว',
-          confirmButtonText: 'ตกลง',
-          allowOutsideClick: false
-        });
-
-        searchInput.value = '';
-        return;
-      }
-
+    if (isNotFound || !ok) {
       playErrorSound();
       setCameraStatus("ไม่พบข้อมูล", "error");
 
@@ -3205,23 +3239,39 @@ document.addEventListener('DOMContentLoaded', () => {
       });
 
       searchInput.value = '';
-
-    } catch (err) {
-      console.error(err);
-      if (reqId !== currentRequestId) return;
-
-      playErrorSound();
-      setCameraStatus("เชื่อมต่อไม่สำเร็จ", "error");
-
-      await Swal.fire({
-        icon: 'error',
-        title: 'เชื่อมต่อไม่สำเร็จ',
-        text: String(err?.message || err),
-        confirmButtonText: 'ตกลง',
-        allowOutsideClick: false
-      });
+      return;
     }
+
+    // fallback สุดท้าย
+    playErrorSound();
+    setCameraStatus("เกิดข้อผิดพลาด", "error");
+
+    await Swal.fire({
+      icon: 'error',
+      title: res.title || 'เกิดข้อผิดพลาด',
+      text: res.detail || res.error || 'ไม่สามารถประมวลผลได้',
+      confirmButtonText: 'ตกลง',
+      allowOutsideClick: false
+    });
+
+    searchInput.value = '';
+
+  } catch (err) {
+    console.error(err);
+    if (reqId !== currentRequestId) return;
+
+    playErrorSound();
+    setCameraStatus("เชื่อมต่อไม่สำเร็จ", "error");
+
+    await Swal.fire({
+      icon: 'error',
+      title: 'เชื่อมต่อไม่สำเร็จ',
+      text: String(err?.message || err),
+      confirmButtonText: 'ตกลง',
+      allowOutsideClick: false
+    });
   }
+}
 
   function gasJsonp(params) {
     return new Promise((resolve, reject) => {
@@ -3301,3 +3351,4 @@ document.addEventListener('DOMContentLoaded', () => {
   setCameraStatus("กล้องปิดอยู่", "idle");
   searchInput.focus();
 });
+
