@@ -3896,97 +3896,200 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  async function runSearch(query) {
-    query = String(query || "").trim().toUpperCase();
-    if (!query) return;
+  // async function runSearch(query) {
+  //   query = String(query || "").trim().toUpperCase();
+  //   if (!query) return;
 
-    bumpIdle_();
-    const reqId = ++currentRequestId;
-    setCameraStatus("กำลังค้นหา...", "loading");
+  //   bumpIdle_();
+  //   const reqId = ++currentRequestId;
+  //   setCameraStatus("กำลังค้นหา...", "loading");
 
-    try {
-      const res = await apiSearchWithRetry_(query, MAX_API_RETRY);
-      if (reqId !== currentRequestId) return;
+  //   try {
+  //     const res = await apiSearchWithRetry_(query, MAX_API_RETRY);
+  //     if (reqId !== currentRequestId) return;
 
-      const record = res?.data?.record || {};
+  //     const record = res?.data?.record || {};
 
-      if (res.status === "success") {
-        showResult(record, res.detail || "บันทึกสำเร็จ");
-        setCameraStatus("บันทึกสำเร็จ", "success");
+  //     if (res.status === "success") {
+  //       showResult(record, res.detail || "บันทึกสำเร็จ");
+  //       setCameraStatus("บันทึกสำเร็จ", "success");
 
-        await Swal.fire({
-          icon: "success",
-          title: res.title || "บันทึกสำเร็จ",
-          text: res.detail || "",
-          timer: 2200,
-          confirmButtonText: "ตกลง"
-        });
+  //       await Swal.fire({
+  //         icon: "success",
+  //         title: res.title || "บันทึกสำเร็จ",
+  //         text: res.detail || "",
+  //         timer: 2200,
+  //         confirmButtonText: "ตกลง"
+  //       });
 
-        searchInput.value = "";
-        return;
-      }
+  //       searchInput.value = "";
+  //       return;
+  //     }
 
-      if (res.status === "duplicate") {
-        playErrorSound();
-        setCameraStatus("พบข้อมูลซ้ำ", "warning");
-        if (Object.keys(record).length) showResult(record, res.detail || "ข้อมูลนี้ออกระบบแล้ว");
+  //     if (res.status === "duplicate") {
+  //       playErrorSound();
+  //       setCameraStatus("พบข้อมูลซ้ำ", "warning");
+  //       if (Object.keys(record).length) showResult(record, res.detail || "ข้อมูลนี้ออกระบบแล้ว");
 
-        await Swal.fire({
-          icon: "warning",
-          title: res.title || "บันทึกซ้ำไม่ได้",
-          text: res.detail || "",
-          confirmButtonText: "ตกลง"
-        });
+  //       await Swal.fire({
+  //         icon: "warning",
+  //         title: res.title || "บันทึกซ้ำไม่ได้",
+  //         text: res.detail || "",
+  //         confirmButtonText: "ตกลง"
+  //       });
 
-        searchInput.value = "";
-        return;
-      }
+  //       searchInput.value = "";
+  //       return;
+  //     }
 
-      if (res.status === "not_found") {
-        playErrorSound();
-        setCameraStatus("ไม่พบข้อมูล", "warning");
-        clearResultCard_();
+  //     if (res.status === "not_found") {
+  //       playErrorSound();
+  //       setCameraStatus("ไม่พบข้อมูล", "warning");
+  //       clearResultCard_();
 
-        await Swal.fire({
-          icon: "warning",
-          title: res.title || "ไม่พบข้อมูล",
-          text: res.detail || "",
-          confirmButtonText: "ตกลง"
-        });
+  //       await Swal.fire({
+  //         icon: "warning",
+  //         title: res.title || "ไม่พบข้อมูล",
+  //         text: res.detail || "",
+  //         confirmButtonText: "ตกลง"
+  //       });
 
-        searchInput.value = "";
-        return;
-      }
+  //       searchInput.value = "";
+  //       return;
+  //     }
 
-      playErrorSound();
-      setCameraStatus("เกิดข้อผิดพลาด", "error");
-      if (Object.keys(record).length) showResult(record, res.detail || "เกิดข้อผิดพลาด");
+  //     playErrorSound();
+  //     setCameraStatus("เกิดข้อผิดพลาด", "error");
+  //     if (Object.keys(record).length) showResult(record, res.detail || "เกิดข้อผิดพลาด");
+
+  //     await Swal.fire({
+  //       icon: "error",
+  //       title: res.title || "เกิดข้อผิดพลาด",
+  //       text: res.detail || res.error || "ไม่สามารถประมวลผลได้",
+  //       confirmButtonText: "ตกลง"
+  //     });
+
+  //     searchInput.value = "";
+
+  //   } catch (err) {
+  //     console.error(err);
+  //     if (reqId !== currentRequestId) return;
+
+  //     playErrorSound();
+  //     setCameraStatus("เชื่อมต่อไม่สำเร็จ", "error");
+
+  //     await Swal.fire({
+  //       icon: "error",
+  //       title: "เชื่อมต่อไม่สำเร็จ",
+  //       text: String(err?.message || err),
+  //       confirmButtonText: "ตกลง"
+  //     });
+  //   }
+  // }
+async function runSearch(query) {
+  query = String(query || "").trim().toUpperCase();
+  if (!query) return;
+
+  bumpIdle_();
+  const reqId = ++currentRequestId;
+  setCameraStatus("กำลังค้นหา...", "loading");
+
+  try {
+    const res = await apiSearchWithRetry_(query, MAX_API_RETRY);
+    if (reqId !== currentRequestId) return;
+
+    const record = res?.data?.record || {};
+
+    if (res.status === "success") {
+      showResult(record, res.detail || "บันทึกสำเร็จ");
+      setCameraStatus("บันทึกสำเร็จ", "success");
 
       await Swal.fire({
-        icon: "error",
-        title: res.title || "เกิดข้อผิดพลาด",
-        text: res.detail || res.error || "ไม่สามารถประมวลผลได้",
-        confirmButtonText: "ตกลง"
+        icon: "success",
+        title: res.title || "บันทึกสำเร็จ",
+        text: res.detail || "",
+        timer: 2000,
+        showConfirmButton: false,
+        allowOutsideClick: true,
+        allowEscapeKey: true
       });
 
       searchInput.value = "";
+      return;
+    }
 
-    } catch (err) {
-      console.error(err);
-      if (reqId !== currentRequestId) return;
-
+    if (res.status === "duplicate") {
       playErrorSound();
-      setCameraStatus("เชื่อมต่อไม่สำเร็จ", "error");
+      setCameraStatus("พบข้อมูลซ้ำ", "warning");
+      if (Object.keys(record).length) showResult(record, res.detail || "ข้อมูลนี้ออกระบบแล้ว");
 
       await Swal.fire({
-        icon: "error",
-        title: "เชื่อมต่อไม่สำเร็จ",
-        text: String(err?.message || err),
-        confirmButtonText: "ตกลง"
+        icon: "warning",
+        title: res.title || "บันทึกซ้ำไม่ได้",
+        text: res.detail || "",
+        timer: 2000,
+        showConfirmButton: false,
+        allowOutsideClick: true,
+        allowEscapeKey: true
       });
-    }
-  }
 
+      searchInput.value = "";
+      return;
+    }
+
+    if (res.status === "not_found") {
+      playErrorSound();
+      setCameraStatus("ไม่พบข้อมูล", "warning");
+      clearResultCard_();
+
+      await Swal.fire({
+        icon: "warning",
+        title: res.title || "ไม่พบข้อมูล",
+        text: res.detail || "",
+        timer: 2000,
+        showConfirmButton: false,
+        allowOutsideClick: true,
+        allowEscapeKey: true
+      });
+
+      searchInput.value = "";
+      return;
+    }
+
+    playErrorSound();
+    setCameraStatus("เกิดข้อผิดพลาด", "error");
+    if (Object.keys(record).length) showResult(record, res.detail || "เกิดข้อผิดพลาด");
+
+    await Swal.fire({
+      icon: "error",
+      title: res.title || "เกิดข้อผิดพลาด",
+      text: res.detail || res.error || "ไม่สามารถประมวลผลได้",
+      timer: 2000,
+      showConfirmButton: false,
+      allowOutsideClick: true,
+      allowEscapeKey: true
+    });
+
+    searchInput.value = "";
+
+  } catch (err) {
+    console.error(err);
+    if (reqId !== currentRequestId) return;
+
+    playErrorSound();
+    setCameraStatus("เชื่อมต่อไม่สำเร็จ", "error");
+
+    await Swal.fire({
+      icon: "error",
+      title: "เชื่อมต่อไม่สำเร็จ",
+      text: String(err?.message || err),
+      timer: 2000,
+      showConfirmButton: false,
+      allowOutsideClick: true,
+      allowEscapeKey: true
+    });
+  }
+}
   async function apiSearch_(query) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
@@ -4024,3 +4127,4 @@ document.addEventListener('DOMContentLoaded', () => {
 
   setCameraStatus("กล้องปิดอยู่", "idle");
 });
+
